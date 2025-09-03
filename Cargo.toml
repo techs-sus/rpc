@@ -3,6 +3,8 @@ name = "rpc"
 version = "0.1.0"
 edition = "2024"
 authors = ["techs-sus"]
+license = "Unlicense"
+readme = "README.md"
 
 [lib]
 name = "rpc"
