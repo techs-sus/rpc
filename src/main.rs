@@ -3,9 +3,7 @@ fn main() -> color_eyre::Result<()> {
 
 	let mut server = rpc::Server::init_with_fishstrap();
 
-	while !server.is_initialized() {
-		std::thread::yield_now(); // TODO: use a condvar and make create methods also yield with it 
-	}
+	server.wait_for_init();
 
 	server.send(b"Hello world!".to_vec())?;
 	server.send(b"Hello world! 2".to_vec())?;

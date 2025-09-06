@@ -8,11 +8,7 @@ use std::{
 	fs::File,
 	io::{BufRead, BufReader},
 	path::PathBuf,
-	sync::{
-		Arc, LazyLock,
-		atomic::{AtomicBool, Ordering},
-		mpsc,
-	},
+	sync::{Arc, Condvar, LazyLock, Mutex, mpsc},
 	thread::JoinHandle,
 	time::Duration,
 };
@@ -42,7 +38,7 @@ static LOCAL_APP_DATA: LazyLock<String> = LazyLock::new(|| {
 });
 
 pub struct Server {
-	initialized: Arc<AtomicBool>,
+	initialized_condvar: Arc<(Mutex<bool>, Condvar)>,
 
 	log_watcher_join_handle: JoinHandle<()>,
 	connection_handler_handle: JoinHandle<()>,
@@ -145,7 +141,7 @@ impl ClientboundPacket {
 	}
 }
 
-fn spawn_log_watcher(log_file: PathBuf, tx: mpsc::Sender<ServerboundPacket>) -> JoinHandle<()> {
+fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) -> JoinHandle<()> {
 	let regex = Regex::new(r"(?m)(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[1-2]\d|3[0-1])T(?:[0-1]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+|)(?:Z|(?:\+|\-)(?:\d{2}):?(?:\d{2}))).+(\[FLog::Output\]) (.+)").unwrap();
 
 	std::thread::spawn(move || {
@@ -183,11 +179,11 @@ fn spawn_log_watcher(log_file: PathBuf, tx: mpsc::Sender<ServerboundPacket>) -> 
 }
 
 fn spawn_connection_handler(
-	rx: mpsc::Receiver<ServerboundPacket>,
+	rx: loole::Receiver<ServerboundPacket>,
 	received_packet_data: loole::Sender<(u32, Vec<u8>)>,
 	serverbound_packet_acknowledgements: Arc<papaya::HashSet<u32>>,
 	cachebuster: Arc<ArcSwap<String>>,
-	initialized: Arc<AtomicBool>,
+	initialized: Arc<(Mutex<bool>, Condvar)>,
 	clientbound_packet_sender: loole::Sender<ClientboundPacket>,
 ) -> JoinHandle<()> {
 	std::thread::spawn(move || {
@@ -197,7 +193,9 @@ fn spawn_connection_handler(
 					starting_cachebuster,
 				} => {
 					cachebuster.swap(Arc::new(starting_cachebuster));
-					initialized.store(true, Ordering::SeqCst);
+
+					*initialized.0.lock().unwrap() = true;
+					initialized.1.notify_all();
 				}
 
 				ServerboundPacket::Acknowledge(id) => {
@@ -278,23 +276,24 @@ fn init_with_version_path(version_path: PathBuf) -> Server {
 	)
 	.expect("failed writing rpc/init.json");
 
-	let (tx, rx) = mpsc::channel();
+	let (tx, rx) = loole::unbounded();
 	let log_watcher_join_handle = spawn_log_watcher(log_file, tx);
 
 	let (packet_data_tx, packet_data_rx) = loole::unbounded();
 	let serverbound_packet_acknowledgements = Arc::new(papaya::HashSet::new());
 
 	let cachebuster_arc_swap = Arc::new(ArcSwap::new(Arc::new(String::new())));
-	let initialized = Arc::new(AtomicBool::new(false));
 
 	let (clientbound_packet_sender, clientbound_packet_receiver) = loole::unbounded();
+
+	let initialized_condvar = Arc::new((Mutex::new(false), Condvar::new()));
 
 	let connection_handler_handle = spawn_connection_handler(
 		rx,
 		packet_data_tx,
 		serverbound_packet_acknowledgements.clone(),
 		cachebuster_arc_swap.clone(),
-		initialized.clone(),
+		initialized_condvar.clone(),
 		clientbound_packet_sender.clone(),
 	);
 
@@ -305,7 +304,7 @@ fn init_with_version_path(version_path: PathBuf) -> Server {
 	);
 
 	Server {
-		initialized,
+		initialized_condvar,
 		log_watcher_join_handle,
 		connection_handler_handle,
 		clientbound_packet_handler_handle,
@@ -348,9 +347,13 @@ fn get_next_cachebuster(cachebuster: &str) -> String {
 }
 
 impl Server {
-	/// Returns a boolean indicating the initialized state of this [`Server`].
-	pub fn is_initialized(&self) -> bool {
-		self.initialized.load(Ordering::SeqCst)
+	/// Instantly returns if this [`Server`] is ready, otherwise waits for it to be initialized.
+	pub fn wait_for_init(&self) {
+		let (lock, condvar) = &*self.initialized_condvar;
+		let mut started = lock.lock().unwrap();
+		while !*started {
+			started = condvar.wait(started).unwrap();
+		}
 	}
 
 	/// Creates and initializes a RPC server using Roblox version paths deducted from [Fishstrap](https://github.com/fishstrap/fishstrap).
@@ -376,7 +379,7 @@ impl Server {
 	/// # Errors
 	/// This function can return an [`Result::Err`] with [`RpcError::NotConnected`] if the startup initialization is not complete.
 	pub fn send(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
-		if !self.initialized.load(Ordering::Relaxed) {
+		if !*self.initialized_condvar.0.lock().unwrap() {
 			return Err(RpcError::NotConnected);
 		}
 
