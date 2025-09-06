@@ -7,16 +7,16 @@ originally discovered by [bainchild](https://github.com/bainchild) in <https://g
 ```luau
 local RPC = require("@pkg/rpc")
 
-Module.init(function(packetId: number, data: buffer)
+RPC.init(function(packetId: number, data: buffer)
 	print(`{packetId} -> {buffer.tostring(data)}`)
 end)
 
 -- This yields until the Rust side sends an Acknowledgement automatically
-Module.send(buffer.fromstring("Hello rpc!"))
+RPC.send(buffer.fromstring("Hello rpc!"))
 
 while task.wait(1) do
 	-- This yields until the Rust side sends an Acknowledgement automatically
-	Module.send(buffer.fromstring("Hello rpc! @ " .. os.clock()))
+	RPC.send(buffer.fromstring("Hello rpc! @ " .. os.clock()))
 end
 ```
 
