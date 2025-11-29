@@ -1,16 +1,18 @@
 use arc_swap::ArcSwap;
 use base64::{Engine, prelude::BASE64_STANDARD};
 use chrono::Utc;
+use parking::{Parker, Unparker};
 use regex::Regex;
 use serde_json::json;
+use smol::{
+	Task,
+	fs::File,
+	io::{AsyncBufReadExt, BufReader},
+};
 use std::{
 	ffi::OsStr,
-	fs::File,
-	io::{BufRead, BufReader},
-	path::PathBuf,
-	sync::{Arc, Condvar, LazyLock, Mutex, mpsc},
-	thread::JoinHandle,
-	time::Duration,
+	path::{Path, PathBuf},
+	sync::{Arc, LazyLock},
 };
 
 use thiserror::Error;
@@ -19,9 +21,6 @@ use thiserror::Error;
 pub enum RpcError {
 	#[error("io error: {0}")]
 	Io(#[from] std::io::Error),
-
-	#[error("got mpsc receive error")]
-	MpscRecvError(#[from] mpsc::RecvError),
 
 	#[error("got loole receive error")]
 	LooleRecvError(#[from] loole::RecvError),
@@ -38,18 +37,20 @@ static LOCAL_APP_DATA: LazyLock<String> = LazyLock::new(|| {
 });
 
 pub struct Server {
-	initialized_condvar: Arc<(Mutex<bool>, Condvar)>,
+	parker: Parker,
 
-	log_watcher_join_handle: JoinHandle<()>,
-	connection_handler_handle: JoinHandle<()>,
-	clientbound_packet_handler_handle: JoinHandle<()>,
+	log_watcher_join_handle: Task<()>,
+	connection_handler_handle: Task<()>,
+	clientbound_packet_handler_handle: Task<()>,
 
 	incoming_serverbound_packets: loole::Receiver<(u32, Vec<u8>)>,
-	serverbound_packet_acknowledgements: Arc<papaya::HashSet<u32>>,
+	serverbound_packet_acknowledgements: Arc<papaya::HashMap<u32, Unparker>>,
 
 	clientbound_packet_queue: loole::Sender<ClientboundPacket>,
 
 	current_clientbound_packet_id: u32,
+
+	connected: bool,
 }
 
 #[repr(u8)]
@@ -117,8 +118,8 @@ pub enum ClientboundPacket {
 impl ClientboundPacket {
 	const fn get_packet_type(&self) -> u8 {
 		match self {
-			ClientboundPacket::Acknowledge(..) => 1,
-			ClientboundPacket::Data(..) => 2,
+			Self::Acknowledge(..) => 1,
+			Self::Data(..) => 2,
 		}
 	}
 
@@ -127,11 +128,11 @@ impl ClientboundPacket {
 		vector.push(self.get_packet_type());
 
 		match self {
-			ClientboundPacket::Acknowledge(packet_id) => {
+			Self::Acknowledge(packet_id) => {
 				vector.extend_from_slice(&packet_id.to_le_bytes());
 			}
 
-			ClientboundPacket::Data(packet_id, data) => {
+			Self::Data(packet_id, data) => {
 				vector.extend_from_slice(&packet_id.to_le_bytes());
 				vector.extend_from_slice(data);
 			}
@@ -141,19 +142,21 @@ impl ClientboundPacket {
 	}
 }
 
-fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) -> JoinHandle<()> {
+fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) -> Task<()> {
 	let regex = Regex::new(r"(?m)(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[1-2]\d|3[0-1])T(?:[0-1]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+|)(?:Z|(?:\+|\-)(?:\d{2}):?(?:\d{2}))).+(\[FLog::Output\]) (.+)").unwrap();
 
-	std::thread::spawn(move || {
-		let file = File::open(log_file).expect("failed opening log file on thread");
+	smol::spawn(async move {
+		let file = File::open(log_file)
+			.await
+			.expect("failed opening log file on thread");
 		let mut reader = BufReader::new(file);
 		let mut buf = String::new();
 
 		loop {
-			let log = reader.read_line(&mut buf);
+			let log = reader.read_line(&mut buf).await;
 
-			if log.is_err() {
-				std::thread::sleep(Duration::from_millis(500));
+			if log.is_err() || buf.is_empty() {
+				smol::Timer::after(std::time::Duration::from_millis(500)).await;
 				continue;
 			}
 
@@ -169,7 +172,8 @@ fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) ->
 						&& let Some(output_data) = captures.get(3).map(|m| m.as_str().trim_end())
 						&& let Some(packet) = ServerboundPacket::parse_from_log_entry(output_data)
 			{
-				tx.send(packet)
+				tx.send_async(packet)
+					.await
 					.expect("watcher thread failed sending packet");
 			}
 
@@ -181,31 +185,34 @@ fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) ->
 fn spawn_connection_handler(
 	rx: loole::Receiver<ServerboundPacket>,
 	received_packet_data: loole::Sender<(u32, Vec<u8>)>,
-	serverbound_packet_acknowledgements: Arc<papaya::HashSet<u32>>,
+	serverbound_packet_acknowledgements: Arc<papaya::HashMap<u32, Unparker>>,
 	cachebuster: Arc<ArcSwap<String>>,
-	initialized: Arc<(Mutex<bool>, Condvar)>,
+	initialized: Unparker,
 	clientbound_packet_sender: loole::Sender<ClientboundPacket>,
-) -> JoinHandle<()> {
-	std::thread::spawn(move || {
-		while let Ok(packet) = rx.recv() {
+) -> Task<()> {
+	smol::spawn(async move {
+		while let Ok(packet) = rx.recv_async().await {
 			match packet {
 				ServerboundPacket::Init {
 					starting_cachebuster,
 				} => {
 					cachebuster.swap(Arc::new(starting_cachebuster));
-
-					*initialized.0.lock().unwrap() = true;
-					initialized.1.notify_all();
+					initialized.unpark();
 				}
 
 				ServerboundPacket::Acknowledge(id) => {
-					serverbound_packet_acknowledgements.pin().insert(id);
+					serverbound_packet_acknowledgements
+						.pin()
+						.remove(&id)
+						.unwrap()
+						.unpark();
 				}
 
 				ServerboundPacket::Data(id, data) => {
-					received_packet_data.send((id, data)).ok(); // TODO: This should never be an Err; so maybe unreachable!()?
+					received_packet_data.send_async((id, data)).await.ok(); // TODO: This should never be an Err; so maybe unreachable!()?
 					clientbound_packet_sender
-						.send(ClientboundPacket::Acknowledge(id))
+						.send_async(ClientboundPacket::Acknowledge(id))
+						.await
 						.ok();
 				}
 			}
@@ -217,9 +224,9 @@ fn spawn_packet_sender(
 	receiver: loole::Receiver<ClientboundPacket>,
 	rpc_data_directory: PathBuf,
 	cachebuster_arc_swap: Arc<ArcSwap<String>>,
-) -> JoinHandle<()> {
-	std::thread::spawn(move || {
-		while let Ok(packet) = receiver.recv() {
+) -> Task<()> {
+	smol::spawn(async move {
+		while let Ok(packet) = receiver.recv_async().await {
 			let cachebuster = cachebuster_arc_swap.load();
 
 			let path = rpc_data_directory.join(format!("{cachebuster}.json"));
@@ -228,15 +235,19 @@ fn spawn_packet_sender(
 
 			let contents = serialize_data_to_font_json(&BASE64_STANDARD.encode(packet.serialize()));
 
-			std::fs::write(&path, &contents).expect("failed write in packet sender thread");
-			std::fs::write(&backup_path, contents).expect("failed backup write in packet sender thread");
+			smol::fs::write(&path, &contents)
+				.await
+				.expect("failed write in packet sender thread");
+			smol::fs::write(&backup_path, contents)
+				.await
+				.expect("failed backup write in packet sender thread");
 
 			cachebuster_arc_swap.store(Arc::new(get_next_cachebuster(&cachebuster)));
 		}
 	})
 }
 
-fn init_with_version_path(version_path: PathBuf) -> Server {
+fn init_with_version_path(version_path: &Path) -> Server {
 	let logs_directory = PathBuf::from(LOCAL_APP_DATA.as_str())
 		.join("Roblox")
 		.join("logs");
@@ -280,20 +291,20 @@ fn init_with_version_path(version_path: PathBuf) -> Server {
 	let log_watcher_join_handle = spawn_log_watcher(log_file, tx);
 
 	let (packet_data_tx, packet_data_rx) = loole::unbounded();
-	let serverbound_packet_acknowledgements = Arc::new(papaya::HashSet::new());
+	let serverbound_packet_acknowledgements = Arc::new(papaya::HashMap::new());
 
 	let cachebuster_arc_swap = Arc::new(ArcSwap::new(Arc::new(String::new())));
 
 	let (clientbound_packet_sender, clientbound_packet_receiver) = loole::unbounded();
 
-	let initialized_condvar = Arc::new((Mutex::new(false), Condvar::new()));
+	let (parker, unparker) = parking::pair();
 
 	let connection_handler_handle = spawn_connection_handler(
 		rx,
 		packet_data_tx,
 		serverbound_packet_acknowledgements.clone(),
 		cachebuster_arc_swap.clone(),
-		initialized_condvar.clone(),
+		unparker,
 		clientbound_packet_sender.clone(),
 	);
 
@@ -304,7 +315,7 @@ fn init_with_version_path(version_path: PathBuf) -> Server {
 	);
 
 	Server {
-		initialized_condvar,
+		parker,
 		log_watcher_join_handle,
 		connection_handler_handle,
 		clientbound_packet_handler_handle,
@@ -314,6 +325,8 @@ fn init_with_version_path(version_path: PathBuf) -> Server {
 		current_clientbound_packet_id: 0,
 
 		clientbound_packet_queue: clientbound_packet_sender,
+
+		connected: false,
 	}
 }
 
@@ -348,12 +361,9 @@ fn get_next_cachebuster(cachebuster: &str) -> String {
 
 impl Server {
 	/// Instantly returns if this [`Server`] is ready, otherwise waits for it to be initialized.
-	pub fn wait_for_init(&self) {
-		let (lock, condvar) = &*self.initialized_condvar;
-		let mut started = lock.lock().unwrap();
-		while !*started {
-			started = condvar.wait(started).unwrap();
-		}
+	pub fn wait_for_init(&mut self) {
+		self.parker.park();
+		self.connected = true;
 	}
 
 	/// Creates and initializes a RPC server using Roblox version paths deducted from [Fishstrap](https://github.com/fishstrap/fishstrap).
@@ -371,36 +381,34 @@ impl Server {
 			.expect("no version in versions directory")
 			.expect("failed reading versions directory entry");
 
-		init_with_version_path(directory_path.join(entry.path()))
+		init_with_version_path(&directory_path.join(entry.path()))
 	}
 
 	/// Sends a block of data and yields the thread until the data was acknowledged.
 	///
 	/// # Errors
 	/// This function can return an [`Result::Err`] with [`RpcError::NotConnected`] if the startup initialization is not complete.
-	pub fn send(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
-		if !*self.initialized_condvar.0.lock().unwrap() {
+	pub async fn send(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
+		if !self.connected {
 			return Err(RpcError::NotConnected);
 		}
 
 		let id = self.current_clientbound_packet_id;
+		let (parker, unparker) = parking::pair();
+
+		self
+			.serverbound_packet_acknowledgements
+			.pin()
+			.insert(id, unparker);
 
 		self
 			.clientbound_packet_queue
-			.send(ClientboundPacket::Data(id, data))?;
+			.send_async(ClientboundPacket::Data(id, data))
+			.await?;
 
 		self.current_clientbound_packet_id += 1;
 
-		loop {
-			let pin = self.serverbound_packet_acknowledgements.pin();
-
-			if pin.contains(&id) {
-				pin.remove(&id);
-				break;
-			}
-
-			std::thread::yield_now(); // TODO: use std::sync::Condvar eventually
-		}
+		parker.park();
 
 		Ok(())
 	}
