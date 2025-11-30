@@ -7,12 +7,15 @@ use serde_json::json;
 use smol::{
 	Task,
 	fs::File,
-	io::{AsyncBufReadExt, BufReader},
+	io::{AsyncBufReadExt, AsyncSeekExt, BufReader},
 };
 use std::{
 	ffi::OsStr,
 	path::{Path, PathBuf},
-	sync::{Arc, LazyLock},
+	sync::{
+		Arc, LazyLock,
+		atomic::{AtomicBool, AtomicU32, Ordering},
+	},
 };
 
 use thiserror::Error;
@@ -37,8 +40,6 @@ static LOCAL_APP_DATA: LazyLock<String> = LazyLock::new(|| {
 });
 
 pub struct Server {
-	parker: Parker,
-
 	log_watcher_join_handle: Task<()>,
 	connection_handler_handle: Task<()>,
 	clientbound_packet_handler_handle: Task<()>,
@@ -48,9 +49,10 @@ pub struct Server {
 
 	clientbound_packet_queue: loole::Sender<ClientboundPacket>,
 
-	current_clientbound_packet_id: u32,
+	current_clientbound_packet_id: AtomicU32,
 
-	connected: bool,
+	parker: Parker,
+	connected: AtomicBool,
 }
 
 #[repr(u8)]
@@ -77,6 +79,10 @@ impl ServerboundPacket {
 		const ACK: u8 = ServerboundPacketType::Acknowledge as u8;
 		const DATA: u8 = ServerboundPacketType::Data as u8;
 
+		if data.is_empty() {
+			return None;
+		}
+
 		let packet_type = u8::from_le_bytes(data[0..1].try_into().ok()?);
 
 		match packet_type {
@@ -84,11 +90,21 @@ impl ServerboundPacket {
 				starting_cachebuster: String::from_utf8(data[1..].to_vec()).ok()?,
 			}),
 
-			ACK => Some(Self::Acknowledge(u32::from_le_bytes(
-				data[1..5].try_into().ok()?,
-			))),
+			ACK => {
+				if data.len() < 5 {
+					return None;
+				}
+
+				Some(Self::Acknowledge(u32::from_le_bytes(
+					data[1..5].try_into().ok()?,
+				)))
+			}
 
 			DATA => {
+				if data.len() < 5 {
+					return None;
+				}
+
 				let id = u32::from_le_bytes(data[1..5].try_into().ok()?);
 				Some(Self::Data(id, data[5..].to_vec()))
 			}
@@ -142,15 +158,22 @@ impl ClientboundPacket {
 	}
 }
 
-fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) -> Task<()> {
-	let regex = Regex::new(r"(?m)(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[1-2]\d|3[0-1])T(?:[0-1]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+|)(?:Z|(?:\+|\-)(?:\d{2}):?(?:\d{2}))).+(\[FLog::Output\]) (.+)").unwrap();
+static LOG_REGEX: LazyLock<Regex> = LazyLock::new(|| {
+	Regex::new(r"(?m)(\d{4}-(?:0[1-9]|1[0-2])-(?:0[1-9]|[1-2]\d|3[0-1])T(?:[0-1]\d|2[0-3]):[0-5]\d:[0-5]\d(?:\.\d+|)(?:Z|(?:\+|\-)(?:\d{2}):?(?:\d{2}))).+(\[FLog::Output\]) (.+)").unwrap()
+});
 
+fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) -> Task<()> {
 	smol::spawn(async move {
 		let file = File::open(log_file)
 			.await
 			.expect("failed opening log file on thread");
 		let mut reader = BufReader::new(file);
 		let mut buf = String::new();
+
+		reader
+			.seek(std::io::SeekFrom::End(0))
+			.await
+			.expect("failed seeking to EOF");
 
 		loop {
 			let log = reader.read_line(&mut buf).await;
@@ -161,7 +184,7 @@ fn spawn_log_watcher(log_file: PathBuf, tx: loole::Sender<ServerboundPacket>) ->
 			}
 
 			if buf.contains("[FLog::Output]") 
-						&& let Some(captures) = regex.captures(&buf)
+						&& let Some(captures) = LOG_REGEX.captures(&buf)
 						&& let Some(timestamp) = captures.get(1).map(|m| m.as_str())
 						&& let Ok(parsed) = chrono::DateTime::parse_from_rfc3339(timestamp).map(|dt| dt.to_utc())
 						&& Utc::now().signed_duration_since(parsed).abs().num_seconds() < 10
@@ -201,11 +224,9 @@ fn spawn_connection_handler(
 				}
 
 				ServerboundPacket::Acknowledge(id) => {
-					serverbound_packet_acknowledgements
-						.pin()
-						.remove(&id)
-						.unwrap()
-						.unpark();
+					if let Some(unparker) = serverbound_packet_acknowledgements.pin().remove(&id) {
+						unparker.unpark();
+					}
 				}
 
 				ServerboundPacket::Data(id, data) => {
@@ -247,89 +268,6 @@ fn spawn_packet_sender(
 	})
 }
 
-fn init_with_version_path(version_path: &Path) -> Server {
-	let logs_directory = PathBuf::from(LOCAL_APP_DATA.as_str())
-		.join("Roblox")
-		.join("logs");
-
-	let mut vec = std::fs::read_dir(&logs_directory)
-		.expect("failed reading log directory")
-		.filter_map(|res| {
-			res.ok().and_then(|entry| {
-				entry.metadata().ok().and_then(|meta| {
-					if meta.is_dir() || entry.path().extension().and_then(OsStr::to_str) != Some("log") {
-						None
-					} else {
-						meta.modified().ok().map(|time| (entry, time))
-					}
-				})
-			})
-		})
-		.collect::<Vec<_>>();
-
-	// get latest log file
-	vec.sort_by(|(_, time), (_, time2)| time2.cmp(time));
-
-	let log_file = vec
-		.first()
-		.expect("failed finding most recently modified log file")
-		.0
-		.path();
-
-	let rpc_data_directory = version_path.join("content").join("fonts").join("rpc");
-
-	std::fs::remove_dir_all(&rpc_data_directory).ok();
-	std::fs::create_dir(&rpc_data_directory).expect("failed creating directory");
-
-	std::fs::write(
-		rpc_data_directory.join("init.json"),
-		serialize_data_to_font_json("blah blah"),
-	)
-	.expect("failed writing rpc/init.json");
-
-	let (tx, rx) = loole::unbounded();
-	let log_watcher_join_handle = spawn_log_watcher(log_file, tx);
-
-	let (packet_data_tx, packet_data_rx) = loole::unbounded();
-	let serverbound_packet_acknowledgements = Arc::new(papaya::HashMap::new());
-
-	let cachebuster_arc_swap = Arc::new(ArcSwap::new(Arc::new(String::new())));
-
-	let (clientbound_packet_sender, clientbound_packet_receiver) = loole::unbounded();
-
-	let (parker, unparker) = parking::pair();
-
-	let connection_handler_handle = spawn_connection_handler(
-		rx,
-		packet_data_tx,
-		serverbound_packet_acknowledgements.clone(),
-		cachebuster_arc_swap.clone(),
-		unparker,
-		clientbound_packet_sender.clone(),
-	);
-
-	let clientbound_packet_handler_handle = spawn_packet_sender(
-		clientbound_packet_receiver,
-		rpc_data_directory,
-		cachebuster_arc_swap,
-	);
-
-	Server {
-		parker,
-		log_watcher_join_handle,
-		connection_handler_handle,
-		clientbound_packet_handler_handle,
-
-		incoming_serverbound_packets: packet_data_rx,
-		serverbound_packet_acknowledgements,
-		current_clientbound_packet_id: 0,
-
-		clientbound_packet_queue: clientbound_packet_sender,
-
-		connected: false,
-	}
-}
-
 fn serialize_data_to_font_json(data: &str) -> String {
 	serde_json::to_string(&json!({
 		"name": blake3::hash(data.as_bytes()).to_hex().as_str(),
@@ -348,22 +286,101 @@ fn serialize_data_to_font_json(data: &str) -> String {
 fn get_backup_cachebuster(cachebuster: &str) -> String {
 	blake3::hash(format!("{cachebuster}pls give backup").as_bytes())
 		.to_hex()
-		.as_str()
 		.to_string()
 }
 
 fn get_next_cachebuster(cachebuster: &str) -> String {
 	blake3::hash(format!("{cachebuster}pls give next").as_bytes())
 		.to_hex()
-		.as_str()
 		.to_string()
 }
 
 impl Server {
-	/// Instantly returns if this [`Server`] is ready, otherwise waits for it to be initialized.
-	pub fn wait_for_init(&mut self) {
-		self.parker.park();
-		self.connected = true;
+	/// Creates and initializes a RPC server using Roblox version paths deducted from [Fishstrap](https://github.com/fishstrap/fishstrap).
+	///
+	/// # Panics
+	/// This function can panic if it cannot create the starting `init.json` file.
+	pub fn init_with_version_path(version_path: &Path) -> Self {
+		let logs_directory = PathBuf::from(LOCAL_APP_DATA.as_str())
+			.join("Roblox")
+			.join("logs");
+
+		let mut vec = std::fs::read_dir(&logs_directory)
+			.expect("failed reading log directory")
+			.filter_map(|res| {
+				res.ok().and_then(|entry| {
+					entry.metadata().ok().and_then(|meta| {
+						if meta.is_dir() || entry.path().extension().and_then(OsStr::to_str) != Some("log") {
+							None
+						} else {
+							meta.modified().ok().map(|time| (entry, time))
+						}
+					})
+				})
+			})
+			.collect::<Vec<_>>();
+
+		// get latest log file
+		vec.sort_by(|(_, time), (_, time2)| time2.cmp(time));
+
+		let log_file = vec
+			.first()
+			.expect("failed finding most recently modified log file")
+			.0
+			.path();
+
+		let rpc_data_directory = version_path.join("content").join("fonts").join("rpc");
+
+		std::fs::remove_dir_all(&rpc_data_directory).ok();
+		std::fs::create_dir(&rpc_data_directory).expect("failed creating directory");
+
+		std::fs::write(
+			rpc_data_directory.join("init.json"),
+			serialize_data_to_font_json("init data can be anything to start the Process"),
+		)
+		.expect("failed writing rpc/init.json");
+
+		let (tx, rx) = loole::unbounded();
+		let log_watcher_join_handle = spawn_log_watcher(log_file, tx);
+
+		let (packet_data_tx, packet_data_rx) = loole::unbounded();
+		let serverbound_packet_acknowledgements = Arc::new(papaya::HashMap::new());
+
+		let cachebuster_arc_swap = Arc::new(ArcSwap::new(Arc::new(String::new())));
+
+		let (clientbound_packet_sender, clientbound_packet_receiver) = loole::unbounded();
+
+		let (parker, unparker) = parking::pair();
+
+		let connection_handler_handle = spawn_connection_handler(
+			rx,
+			packet_data_tx,
+			serverbound_packet_acknowledgements.clone(),
+			cachebuster_arc_swap.clone(),
+			unparker,
+			clientbound_packet_sender.clone(),
+		);
+
+		let clientbound_packet_handler_handle = spawn_packet_sender(
+			clientbound_packet_receiver,
+			rpc_data_directory,
+			cachebuster_arc_swap,
+		);
+
+		Self {
+			parker,
+			log_watcher_join_handle,
+			connection_handler_handle,
+			clientbound_packet_handler_handle,
+
+			incoming_serverbound_packets: packet_data_rx,
+			serverbound_packet_acknowledgements,
+			current_clientbound_packet_id: AtomicU32::new(0),
+
+			clientbound_packet_queue: clientbound_packet_sender,
+
+			connected: AtomicBool::new(false),
+		}
 	}
 
 	/// Creates and initializes a RPC server using Roblox version paths deducted from [Fishstrap](https://github.com/fishstrap/fishstrap).
@@ -381,19 +398,32 @@ impl Server {
 			.expect("no version in versions directory")
 			.expect("failed reading versions directory entry");
 
-		init_with_version_path(&directory_path.join(entry.path()))
+		Self::init_with_version_path(&directory_path.join(entry.path()))
+	}
+
+	/// Instantly returns if this [`Server`] is ready, otherwise waits for it to be initialized.
+	/// Purposefully takes [`&mut self`] as it should NOT be called concurrently.
+	pub fn wait_for_init(&mut self) {
+		if self.connected.load(Ordering::Acquire) {
+			return;
+		}
+
+		self.parker.park();
+		self.connected.store(true, Ordering::Release);
 	}
 
 	/// Sends a block of data and yields the thread until the data was acknowledged.
 	///
 	/// # Errors
-	/// This function can return an [`Result::Err`] with [`RpcError::NotConnected`] if the startup initialization is not complete.
-	pub async fn send(&mut self, data: Vec<u8>) -> Result<(), RpcError> {
-		if !self.connected {
+	/// This function returns a [`Result::Err`] with [`RpcError::NotConnected`] if [`Self::wait_for_init`] is not called.
+	pub async fn send(&self, data: Vec<u8>) -> Result<(), RpcError> {
+		if !self.connected.load(Ordering::Acquire) {
 			return Err(RpcError::NotConnected);
 		}
 
-		let id = self.current_clientbound_packet_id;
+		let id = self
+			.current_clientbound_packet_id
+			.fetch_add(1, Ordering::Relaxed);
 		let (parker, unparker) = parking::pair();
 
 		self
@@ -406,8 +436,7 @@ impl Server {
 			.send_async(ClientboundPacket::Data(id, data))
 			.await?;
 
-		self.current_clientbound_packet_id += 1;
-
+		/* park thread, wait for acknowledgement */
 		parker.park();
 
 		Ok(())
